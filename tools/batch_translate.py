@@ -63,6 +63,8 @@ TRAD = set("與裝內們個來這說時會對後點過還讓當麼開關見體�
 REFUSAL_EN = ("i'm sorry", "i am sorry", "i can't", "i cannot", "as an ai")
 REFUSAL_ZH = ("无法协助", "不能协助", "无法提供此", "我不能帮")
 NUMBER = re.compile(r"^([A-Za-z0-9]+(?:-[A-Za-z0-9]+)+-?)\s*")  # leading product number, e.g. "ABC-123"
+# notes some translators append to the title, e.g. "\n\n(Translation: ...)" or "（翻译为中文：...）"
+GARBLE = re.compile(r"\n|translation\s*:|[（(]翻译|翻译为中文|译文[:：]", re.IGNORECASE)
 
 
 def log(msg):
@@ -208,8 +210,12 @@ def candidates(uid, journal):
             settled = last.get("status") in ("updated", "unchanged") and verdict(current, ot) is None
             if not settled:
                 c.update(number=number, title=ot)
-                c["why"].append("garbled" if "\n" in name or not name.endswith(ot)
+                c["why"].append("garbled" if GARBLE.search(name) or not name.endswith(ot)
                                 else f"retry-{last['status']}" if last else "new")
+        elif ot and GARBLE.search(name) and NUMBER.match(name):
+            # Translator notes glued to the name, where the original title is no longer found verbatim.
+            c.update(number=NUMBER.match(name).group(1).rstrip("-"), title=ot)
+            c["why"].append("garbled")
         elif ot and last.get("status") == "updated" and last.get("new_name") == name:
             # Translated by an earlier run and not edited since: re-check it against today's rules
             # (catches e.g. a long title that came back as just the actress name).
