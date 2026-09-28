@@ -1,0 +1,13 @@
+version: "3"
+services:
+  deepseek-proxy:
+    build: .
+    image: metatube-deepseek-proxy:local
+    container_name: deepseek-proxy
+    ports:
+      - "8765:8765"
+    environment:
+      - THINKING=disabled
+    volumes:
+      - ./data:/data
+    restart: unless-stopped
