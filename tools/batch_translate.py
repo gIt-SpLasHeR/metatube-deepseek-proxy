@@ -62,6 +62,7 @@ HAN = re.compile(r"[一-鿿]")
 TRAD = set("與裝內們個來這說時會對後點過還讓當麼開關見體愛動樂親無為從應實國學頭氣間長門問題覺經樣發現進選邊兒麗戀顏絕淚誘戰覽擊聲戲劇歡嬌嫵憶誰妳廳鬆亂濕脫")
 REFUSAL_EN = ("i'm sorry", "i am sorry", "i can't", "i cannot", "as an ai")
 REFUSAL_ZH = ("无法协助", "不能协助", "无法提供此", "我不能帮")
+NUMBER = re.compile(r"^([A-Za-z0-9]+(?:-[A-Za-z0-9]+)+-?)\s*")  # leading product number, e.g. "ABC-123"
 
 
 def log(msg):
@@ -217,6 +218,13 @@ def candidates(uid, journal):
             if number is not None and name.startswith(number) and verdict(name[len(number):].strip(), ot):
                 c.update(number=number, title=ot)
                 c["why"].append("recheck")
+        elif ot and not last:
+            # Translated before this tool existed (another model/engine): redo it if it fails today's checks,
+            # e.g. Traditional Chinese, half-translated, or with the translator's notes appended.
+            m = NUMBER.match(name)
+            if m and verdict(name[m.end():].strip(), ot):
+                c.update(number=m.group(1).rstrip("-"), title=ot)
+                c["why"].append("legacy")
         if c["do_overview"]:
             c["why"].append("overview")
         if c["title"] or c["do_overview"]:
