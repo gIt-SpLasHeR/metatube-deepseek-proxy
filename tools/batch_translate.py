@@ -54,10 +54,14 @@ Rules:
 6. Do not add any explanations, notes, or comments under any circumstances.
 7. Only output the translation result, with no additional content."""
 USER_PROMPT = "Please translate the following text into Chinese:"
+# Only for the thinking-on retry of a bad first result: ask for Simplified Chinese explicitly.
+USER_PROMPT_RETRY = "Please translate the following text into Simplified Chinese:"
 
 KANA = re.compile(r"[぀-ヿ]")
+HAN = re.compile(r"[一-鿿]")
 TRAD = set("與裝內們個來這說時會對後點過還讓當麼開關見體愛動樂親無為從應實國學頭氣間長門問題覺經樣發現進選邊兒麗戀顏絕淚誘戰覽擊聲戲劇歡嬌嫵憶誰妳廳鬆亂濕脫")
-REFUSAL = ("i'm sorry", "i can't", "i cannot", "抱歉", "无法协助", "不能协助")
+REFUSAL_EN = ("i'm sorry", "i am sorry", "i can't", "i cannot", "as an ai")
+REFUSAL_ZH = ("无法协助", "不能协助", "无法提供此", "我不能帮")
 
 
 def log(msg):
@@ -86,12 +90,25 @@ def wait_off_peak():
         time.sleep(300)
 
 
-def verdict(out):
-    if not out or any(r in out.lower() for r in REFUSAL):
-        return "refused/empty"
-    cjk = len(re.findall(r"[一-鿿]", out))
-    if cjk == 0 or len(re.findall(r"[A-Za-z]", out)) > cjk:
+def looks_japanese(text, share):
+    """True when kana make up more than `share` of the CJK text (names kept in kana stay well below that)."""
+    kana, han = len(KANA.findall(text)), len(HAN.findall(text))
+    return kana >= 6 and kana > share * (kana + han)
+
+
+def verdict(out, src):
+    """None if `out` is an acceptable Simplified Chinese translation of `src`, otherwise the problem."""
+    if not out.strip():
+        return "empty"
+    low, src_low = out.lower(), src.lower()
+    if any(p in low and p not in src_low for p in REFUSAL_EN) or any(p in out and p not in src for p in REFUSAL_ZH):
+        return "refused"
+    # Brand names legitimately stay in (or turn into) Latin letters, so measure Han characters, not letters.
+    src_cjk = len(HAN.findall(src)) + len(KANA.findall(src))
+    if src_cjk >= 4 and len(HAN.findall(out)) < 0.3 * src_cjk:
         return "not-chinese"
+    if looks_japanese(out, 0.4):
+        return "japanese"
     if sum(c in TRAD for c in out) >= 2:
         return "traditional"
     return None
@@ -99,7 +116,8 @@ def verdict(out):
 
 def translate(text, thinking):
     body = {"model": "deepseek-flash", "max_completion_tokens": 1000, "temperature": 0.1, "top_p": 1.0,
-            "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": USER_PROMPT},
+            "messages": [{"role": "system", "content": SYSTEM},
+                         {"role": "user", "content": USER_PROMPT_RETRY if thinking else USER_PROMPT},
                          {"role": "user", "content": text}]}
     if thinking:
         body["thinking"] = {"type": "enabled"}  # the proxy keeps an explicit client setting
@@ -132,17 +150,17 @@ def translate_checked(text):
 def _translate_checked(text):
     out, tokens, cost = translate(text, thinking=False)
     info = {"tokens": tokens, "cost": cost, "thinking_fallback": False}
-    problem = verdict(out)
+    problem = verdict(out, text)
     if problem:
         info["first_try"] = {"problem": problem, "output": out[:200]}
         out, tokens, cost = translate(text, thinking=True)
         info.update(tokens=info["tokens"] + tokens, cost=info["cost"] + cost, thinking_fallback=True)
-        problem = verdict(out)
+        problem = verdict(out, text)
     info["problem"] = problem
     return (None if problem else out), info
 
 
-def candidates(uid):
+def fetch_movies(uid):
     items, start = [], 0
     while True:
         q = urllib.parse.urlencode({"userId": uid, "includeItemTypes": "Movie", "recursive": "true", "startIndex": start,
@@ -151,29 +169,74 @@ def candidates(uid):
         items += page["Items"]
         start += len(page["Items"])
         if not page["Items"] or start >= page["TotalRecordCount"]:
-            break
+            return items
+
+
+def load_journal():
+    """id -> records, oldest first."""
+    recs = {}
+    if os.path.exists(JOURNAL):
+        for line in open(JOURNAL, encoding="utf-8"):
+            if line.strip():
+                r = json.loads(line)
+                recs.setdefault(r["id"], []).append(r)
+    return recs
+
+
+def candidates(uid, journal):
+    """Movies whose title and/or overview still need translating.
+
+    Name is built as "{number} {title}". While untranslated (or garbled by an earlier translator that
+    appended notes) it still contains OriginalTitle, and the part before it is the number. A name that
+    contains OriginalTitle is left alone when an earlier run already settled it and the current title
+    passes today's checks (names or pure-kanji titles translate to themselves).
+    """
     out = []
-    for it in items:
-        ot, name = (it.get("OriginalTitle") or "").strip(), (it.get("Name") or "").strip()
-        if "MetaTube" not in (it.get("ProviderIds") or {}) or not ot or not name.endswith(ot):
+    for it in fetch_movies(uid):
+        if "MetaTube" not in (it.get("ProviderIds") or {}):
             continue
-        out.append({"id": it["Id"], "number": name[: -len(ot)].strip(), "title": ot, "name": name,
-                    "overview": it.get("Overview") or ""})
+        name = (it.get("Name") or "").strip()
+        ot = (it.get("OriginalTitle") or "").strip()
+        overview = it.get("Overview") or ""
+        c = {"id": it["Id"], "name": name, "overview": overview, "number": None, "title": None,
+             "do_overview": looks_japanese(overview, 0.25), "why": []}
+        last = (journal.get(it["Id"]) or [{}])[-1]
+        i = name.find(ot) if ot else -1
+        if i >= 0:
+            number, current = name[:i].strip(), name[i:].strip()
+            settled = last.get("status") in ("updated", "unchanged") and verdict(current, ot) is None
+            if not settled:
+                c.update(number=number, title=ot)
+                c["why"].append("garbled" if "\n" in name or not name.endswith(ot)
+                                else f"retry-{last['status']}" if last else "new")
+        elif ot and last.get("status") == "updated" and last.get("new_name") == name:
+            # Translated by an earlier run and not edited since: re-check it against today's rules
+            # (catches e.g. a long title that came back as just the actress name).
+            j = last["old_name"].find(ot)
+            number = last["old_name"][:j].strip() if j >= 0 else None
+            if number is not None and name.startswith(number) and verdict(name[len(number):].strip(), ot):
+                c.update(number=number, title=ot)
+                c["why"].append("recheck")
+        if c["do_overview"]:
+            c["why"].append("overview")
+        if c["title"] or c["do_overview"]:
+            out.append(c)
     return out
 
 
 def main():
     uid = [u for u in jf("GET", "/Users") if u["Policy"]["IsAdministrator"]][0]["Id"]
-    done = set()
-    if os.path.exists(JOURNAL):
-        done = {json.loads(line)["id"] for line in open(JOURNAL, encoding="utf-8") if line.strip()}
-    todo = [c for c in candidates(uid) if c["id"] not in done]
-    with_ov = sum(1 for c in todo if KANA.search(c["overview"]))
-    log(f"candidates: {len(todo)} untranslated (+{len(done)} already in journal), {with_ov} with Japanese overview")
+    journal = load_journal()
+    todo = candidates(uid, journal)
+    reasons = {}
+    for c in todo:
+        for w in c["why"]:
+            reasons[w] = reasons.get(w, 0) + 1
+    log(f"candidates: {len(todo)} {reasons}")
 
     if DRY_RUN:
-        for c in todo[:5]:
-            log(f"  {c['id']} number={c['number']!r} title={c['title'][:40]!r} overview={len(c['overview'])} chars")
+        for c in todo[:40]:
+            log(f"  {c['why']} number={c['number']!r} name={c['name'][:50]!r}")
         return
 
     if START_AT:
@@ -184,45 +247,45 @@ def main():
             log(f"waiting until {start:%Y-%m-%d %H:%M} Beijing time")
             time.sleep((start - now).total_seconds())
 
-    spent, ok, failed, fallback = 0.0, 0, 0, 0
+    spent, counts, fallback = 0.0, {"updated": 0, "unchanged": 0, "skipped": 0}, 0
     t0 = time.time()
-    with open(JOURNAL, "a", encoding="utf-8") as journal:
+    with open(JOURNAL, "a", encoding="utf-8") as jf_out:
         for n, c in enumerate(todo[: LIMIT or None], 1):
             wait_off_peak()
-            title, tinfo = translate_checked(c["title"])
-            overview, oinfo = (None, None)
-            if KANA.search(c["overview"]):
-                overview, oinfo = translate_checked(c["overview"])
-            spent += tinfo["cost"] + (oinfo["cost"] if oinfo else 0)
-            fallback += tinfo["thinking_fallback"] + bool(oinfo and oinfo["thinking_fallback"])
+            title, tinfo = translate_checked(c["title"]) if c["title"] else (None, None)
+            overview, oinfo = translate_checked(c["overview"]) if c["do_overview"] else (None, None)
+            for info in (tinfo, oinfo):
+                if info:
+                    spent += info["cost"]
+                    fallback += info["thinking_fallback"]
 
-            rec = {"id": c["id"], "ts": datetime.now(BEIJING).isoformat(timespec="seconds"), "old_name": c["name"],
-                   "old_overview": c["overview"], "title_info": tinfo, "overview_info": oinfo}
-            if title:
+            new_name = f"{c['number']} {title}".strip() if title else c["name"]
+            new_overview = overview or c["overview"]
+            failed = (c["title"] and not title) or (c["do_overview"] and not overview)
+            if new_name != c["name"] or new_overview != c["overview"]:
                 dto = jf("GET", f"/Items/{c['id']}?userId={uid}")
-                dto["Name"] = f"{c['number']} {title}".strip()
-                if overview:
-                    dto["Overview"] = overview
+                dto["Name"], dto["Overview"] = new_name, new_overview
                 jf("POST", f"/Items/{c['id']}", dto)
-                rec.update(new_name=dto["Name"], new_overview=overview, status="updated")
-                ok += 1
+                status = "updated"
             else:
-                rec["status"] = "skipped"
-                failed += 1
-            journal.write(json.dumps(rec, ensure_ascii=False) + "\n")
-            journal.flush()
+                status = "skipped" if failed else "unchanged"
+            counts[status] += 1
+            rec = {"id": c["id"], "ts": datetime.now(BEIJING).isoformat(timespec="seconds"), "status": status,
+                   "why": c["why"], "old_name": c["name"], "old_overview": c["overview"], "new_name": new_name,
+                   "new_overview": overview, "title_info": tinfo, "overview_info": oinfo}
+            jf_out.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            jf_out.flush()
 
             if n % 50 == 0 or n == len(todo):
-                log(f"{n}/{len(todo)} updated={ok} skipped={failed} thinking_fallback={fallback} "
-                    f"≈¥{spent:.3f} {(time.time() - t0) / n:.1f}s/item")
-            if n == PILOT and failed > PILOT * 0.1:
-                log(f"pilot failed: {failed}/{PILOT} skipped, stopping")
+                log(f"{n}/{len(todo)} {counts} thinking_fallback={fallback} ≈¥{spent:.3f} "
+                    f"{(time.time() - t0) / n:.1f}s/item")
+            if n == PILOT and counts["skipped"] > PILOT * 0.1:
+                log(f"pilot failed: {counts['skipped']}/{PILOT} skipped, stopping")
                 sys.exit(1)
             if spent > BUDGET:
                 log(f"budget ¥{BUDGET} exceeded (≈¥{spent:.2f}), stopping")
                 sys.exit(1)
-    log(f"done: updated={ok} skipped={failed} thinking_fallback={fallback} ≈¥{spent:.3f} "
-        f"in {(time.time() - t0) / 60:.0f} min")
+    log(f"done: {counts} thinking_fallback={fallback} ≈¥{spent:.3f} in {(time.time() - t0) / 60:.0f} min")
 
 
 if __name__ == "__main__":

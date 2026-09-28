@@ -27,11 +27,14 @@ def main():
     if not ids and "--all" not in args:
         sys.exit(__doc__)
     uid = [u for u in jf("GET", "/Users") if u["Policy"]["IsAdministrator"]][0]["Id"]
-    restored = 0
+    # An item can appear in several runs; its first "updated" record holds the values from before any run.
+    first = {}
     for line in open(journal, encoding="utf-8"):
         rec = json.loads(line)
-        if rec.get("status") != "updated" or (ids and rec["id"] not in ids):
-            continue
+        if rec.get("status") == "updated" and rec["id"] not in first and (not ids or rec["id"] in ids):
+            first[rec["id"]] = rec
+    restored = 0
+    for rec in first.values():
         dto = jf("GET", f"/Items/{rec['id']}?userId={uid}")
         dto["Name"], dto["Overview"] = rec["old_name"], rec["old_overview"]
         jf("POST", f"/Items/{rec['id']}", dto)
