@@ -58,6 +58,10 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):  # route http.server access logs through logging
         log.info("%s %s", self.address_string(), fmt % args)
 
+    def log_request(self, code="-", size="-"):
+        if getattr(self, "path", None) != "/healthz":  # the Docker healthcheck hits it every 30s
+            super().log_request(code, size)
+
     def _send(self, status: int, headers, body: bytes) -> None:
         self.send_response(status)
         for k, v in headers:
